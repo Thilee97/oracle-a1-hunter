@@ -1,0 +1,128 @@
+name: Oracle A1 Hunter
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Every 5 minutes, offset from minute 00
+    - cron: "3/5 * * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: oracle-a1-hunter
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    env:
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      OCI_CLI_KEY_CONTENT: ${{ secrets.OCI_PRIVATE_KEY }}
+      OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+      OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+      OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+      OCI_REGION: ${{ secrets.OCI_REGION }}
+      OCI_COMPARTMENT_OCID: ${{ secrets.OCI_COMPARTMENT_OCID }}
+      OCI_SUBNET_OCID: ${{ secrets.OCI_SUBNET_OCID }}
+      OCI_IMAGE_OCID: ${{ secrets.OCI_IMAGE_OCID }}
+      OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
+      INSTANCE_NAME: oracle-a1-2c12g
+      OCI_SHAPE: VM.Standard.A1.Flex
+      OCI_OCPUS: "2"
+      OCI_MEMORY_GB: "12"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install OCI CLI
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install oci-cli
+
+      - name: Configure OCI CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_CLI_KEY_CONTENT" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+
+          cat > "$HOME/.oci/config" <<EOF
+          [DEFAULT]
+          user=$OCI_USER_OCID
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY_OCID
+          region=$OCI_REGION
+          key_file=$HOME/.oci/oci_api_key.pem
+          EOF
+          chmod 600 "$HOME/.oci/config"
+
+          oci iam region-subscription list \
+            --tenancy-id "$OCI_TENANCY_OCID" \
+            --query "data[?\"region-name\"=='$OCI_REGION'].\"region-name\" | [0]" \
+            --raw-output
+
+      - name: Hunt A1
+        id: hunt
+        shell: bash
+        run: |
+          chmod +x scripts/hunt.sh scripts/collect_instance_info.sh
+          scripts/hunt.sh
+
+      - name: Collect VPS information
+        id: info
+        if: steps.hunt.outputs.created == 'true' || steps.hunt.outputs.exists == 'true'
+        shell: bash
+        env:
+          INSTANCE_ID: ${{ steps.hunt.outputs.instance_id }}
+        run: |
+          scripts/collect_instance_info.sh
+
+      - name: Send Telegram notification
+        if: steps.hunt.outputs.created == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${TELEGRAM_BOT_TOKEN:-}" || -z "${TELEGRAM_CHAT_ID:-}" ]]; then
+            echo "::warning::Telegram secrets are missing; skipping notification."
+            exit 0
+          fi
+
+          if [[ ! -f vps_summary.txt || ! -f vps_details.json ]]; then
+            echo "::error::VPS information files were not generated."
+            exit 1
+          fi
+
+          MESSAGE="$(cat vps_summary.txt)"
+
+          # Telegram sendMessage limit is 4096 chars; summary is intentionally compact.
+          curl --fail-with-body -sS \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+            --data-urlencode "text=${MESSAGE}"
+
+          # Send the full structured information as a JSON document.
+          curl --fail-with-body -sS \
+            -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+            -F "chat_id=${TELEGRAM_CHAT_ID}" \
+            -F "caption=Oracle VPS full details (no API/private keys included)" \
+            -F "document=@vps_details.json;type=application/json"
+
+      - name: Disable workflow after success
+        if: steps.hunt.outputs.created == 'true' || steps.hunt.outputs.exists == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Instance exists/was created. Disabling scheduled hunter."
+          gh api \
+            --method PUT \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/oracle-a1.yml/disable"
